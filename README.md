@@ -1,4 +1,3 @@
-```markdown
 # Advanced Computer Vision Suite
 
 An all-in-one desktop application offering multiple computer vision demos and tools, built with Python and Tkinter.
