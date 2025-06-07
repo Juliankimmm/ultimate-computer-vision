@@ -12,7 +12,7 @@ import json
 import os
 from datetime import datetime
 import pickle
-import winsound
+import time
 
 class CVApp:
     def __init__(self):
@@ -42,8 +42,14 @@ class CVApp:
         self.pushup_counter = RepCounter(down_threshold=90, up_threshold=160)
         self.pullup_counter = RepCounter(down_threshold=90, up_threshold=160)
         self.squat_counter = RepCounter(down_threshold=90, up_threshold=160)
-        # track last posture state (good vs bad)
-        self.last_posture_ok = True
+        
+        # posture‐checker calibration & thresholds
+        self.posture_baseline = {}  # will hold {'side': angle, 'front': depth_diff}
+        self.posture_threshold = {
+            'side': 10.0,    # degrees below baseline: bad
+        }
+        self.calibrating_posture = False
+        self.calibration_start = None
         
         # Face recognition database
         self.face_database = self.load_face_database()
@@ -169,11 +175,9 @@ class CVApp:
         
         inst_text = """Advanced Features Guide:
 
-• Face Recognition: Register faces by pressing 'r' when face is detected, then recognize them
 • Hand Gestures: Shows hand landmarks and basic gesture recognition (peace, thumbs up, etc.)
 • Color Tracking: Tracks objects by color - select color with 'c' key
 • Motion Detection: Highlights areas with movement
-• QR/Barcode Scanner: Automatically detects and decodes QR codes and barcodes
 • Distance Measurement: Click two points to measure distance (requires calibration)
 
 General Controls:
@@ -235,6 +239,12 @@ General Controls:
             self.current_mode = "none"
             self.status_var.set("Camera stopped")
             return
+        
+        if mode == "posture_checker":
+            self.calibrating_posture = True
+            self.calibration_start = time.time()
+            # clear any old baseline
+            self.posture_baseline.pop('side', None)
             
         self.current_mode = mode
         self.status_var.set(f"Loading {mode.replace('_', ' ').title()} mode...")
@@ -297,27 +307,31 @@ General Controls:
         self.running = True
         self.status_var.set(f"Running {self.current_mode.replace('_', ' ').title()} mode - Press 'q' to stop")
         
-        # Mouse callback for object detection corrections
+        # Mouse callbacks
         if self.current_mode == "object":
-            cv2.namedWindow(f"CV Demo - {self.current_mode.title()} Mode")
-            cv2.setMouseCallback(f"CV Demo - {self.current_mode.title()} Mode", self.mouse_callback)
-        
+            win_name = f"CV Demo - {self.current_mode.title()} Mode"
+            cv2.namedWindow(win_name)
+            cv2.setMouseCallback(win_name, self.mouse_callback)
         elif self.current_mode == "distance_measure":
             win_name = f"CV Demo - Distance Measure Mode"
             cv2.namedWindow(win_name)
             cv2.setMouseCallback(win_name, self.mouse_callback)
-            # reset any old points
             self.measurement_points = []
-        
+        else:
+            win_name = f"CV Demo - {self.current_mode.replace('_', ' ').title()} Mode"
+            cv2.namedWindow(win_name)
+
         while self.running:
             ret, frame = self.cap.read()
-            if not ret:
-                break
-                
+            if not ret or frame is None:
+                # skip bad frames
+                time.sleep(0.01)
+                continue
+            
             frame = cv2.flip(frame, 1)
             self.frame_for_correction = frame.copy()
             
-            # Process frame based on current mode
+            # dispatch to the active mode
             if self.current_mode == "object":
                 frame = self.process_object_detection(frame)
             elif self.current_mode == "emotion":
@@ -335,17 +349,24 @@ General Controls:
             elif self.current_mode == "posture_checker":
                 frame = self.process_posture_checker(frame)
             
-            # Add help overlay
-            cv2.putText(frame, "Press 'h' for help, 'q' to quit", (10, frame.shape[0] - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-            cv2.imshow(f"CV Demo - {self.current_mode.replace('_', ' ').title()} Mode", frame)
+            # safe overlay & imshow
+            h = frame.shape[0]
+            cv2.putText(frame, "Press 'h' for help, 'q' to quit",
+                        (10, h - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.imshow(win_name, frame)
             
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('h'):
                 self.show_help_overlay()
+            elif key == ord('r') and self.current_mode == "posture_checker":
+                # Recalibrate posture
+                self.calibrating_posture = True
+                self.calibration_start = time.time()
+                self.posture_baseline = {}
+                print("Recalibrating posture...")
         
         self.stop_camera()
 
@@ -354,44 +375,162 @@ General Controls:
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.pose.process(img_rgb)
 
-        if not results.pose_landmarks:
-            cv2.putText(frame, "Sit fully in view", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        # Draw skeleton (even during countdown)
+        if results.pose_landmarks:
+            mp.solutions.drawing_utils.draw_landmarks(
+                frame, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS,
+                landmark_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(color=(245,117,66), thickness=2, circle_radius=2),
+                connection_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(color=(245,66,230), thickness=2, circle_radius=2)
+            )
+
+        # If we're calibrating, show countdown
+        if self.calibrating_posture:
+            elapsed = time.time() - self.calibration_start
+            if elapsed < 5.0:
+                # Show countdown 5→1
+                count = 5 - int(elapsed)
+                cv2.putText(frame, f"Sit with GOOD posture!", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 200), 2)
+                cv2.putText(frame, f"Calibrating in: {count}", (10, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 200), 3)
+                cv2.putText(frame, "Sit up straight, shoulders back!", (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                return frame
+            else:
+                # Final calibration frame: capture baseline
+                if results.pose_landmarks:
+                    h, w, _ = frame.shape
+                    lm = results.pose_landmarks.landmark
+                    
+                    # Get shoulder and hip landmarks (using left side for consistency)
+                    left_shoulder = lm[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER.value]
+                    left_hip = lm[mp.solutions.pose.PoseLandmark.LEFT_HIP.value]
+                    left_ear = lm[mp.solutions.pose.PoseLandmark.LEFT_EAR.value]
+                    
+                    # Convert to pixel coordinates
+                    sh_pt = np.array([int(left_shoulder.x*w), int(left_shoulder.y*h)])
+                    hp_pt = np.array([int(left_hip.x*w), int(left_hip.y*h)])
+                    ear_pt = np.array([int(left_ear.x*w), int(left_ear.y*h)])
+                    
+                    # Calculate spine angle (shoulder to hip vs vertical)
+                    spine_vec = sh_pt - hp_pt
+                    vertical_vec = np.array([0, -1])  # Pointing up
+                    spine_norm = spine_vec / (np.linalg.norm(spine_vec) + 1e-8)
+                    spine_angle = np.degrees(np.arccos(np.clip(np.dot(spine_norm, vertical_vec), -1.0, 1.0)))
+                    
+                    # Calculate head forward position (ear to shoulder horizontal distance)
+                    head_forward = abs(ear_pt[0] - sh_pt[0])
+                    
+                    # Store baseline measurements
+                    self.posture_baseline = {
+                        'spine_angle': spine_angle,
+                        'head_forward': head_forward
+                    }
+                    
+                    print(f"Baseline calibrated - Spine angle: {spine_angle:.1f}°, Head forward: {head_forward}px")
+
+                self.calibrating_posture = False
+                cv2.putText(frame, "Calibration Complete!", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                cv2.putText(frame, "Now monitoring your posture...", (10, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                return frame
+
+        # Normal posture monitoring (after calibration)
+        if not self.posture_baseline or not results.pose_landmarks:
+            cv2.putText(frame, "No posture baseline - restart mode", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return frame
 
+        # Calculate current posture metrics
         h, w, _ = frame.shape
         lm = results.pose_landmarks.landmark
-
-        # helper to scale normalized coords
-        def pt(i):
-            return np.array([int(lm[i].x*w), int(lm[i].y*h)])
-
-        # get shoulder, hip, knee on right side
-        shoulder = pt(mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER.value)
-        hip      = pt(mp.solutions.pose.PoseLandmark.RIGHT_HIP.value)
-        knee     = pt(mp.solutions.pose.PoseLandmark.RIGHT_KNEE.value)
-
-        # compute angle at the hip
-        angle = calculate_angle(shoulder, hip, knee)
-
-        # draw skeleton
-        mp.solutions.drawing_utils.draw_landmarks(
-            frame, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
-
-        # decide posture
-        if angle < 150:
-            color = (0, 0, 255)
-            status = "Bad Posture!"
-        else:
-            color = (0, 255, 0)
-            status = "Good Posture"
-
-        # overlay text and angle
-        cv2.putText(frame, f"Hip angle: {angle:.0f}°", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-        cv2.putText(frame, status, (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-
+        
+        # Get current landmarks
+        left_shoulder = lm[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER.value]
+        left_hip = lm[mp.solutions.pose.PoseLandmark.LEFT_HIP.value]
+        left_ear = lm[mp.solutions.pose.PoseLandmark.LEFT_EAR.value]
+        
+        # Convert to pixel coordinates
+        sh_pt = np.array([int(left_shoulder.x*w), int(left_shoulder.y*h)])
+        hp_pt = np.array([int(left_hip.x*w), int(left_hip.y*h)])
+        ear_pt = np.array([int(left_ear.x*w), int(left_ear.y*h)])
+        
+        # Calculate current spine angle
+        spine_vec = sh_pt - hp_pt
+        vertical_vec = np.array([0, -1])
+        spine_norm = spine_vec / (np.linalg.norm(spine_vec) + 1e-8)
+        current_spine_angle = np.degrees(np.arccos(np.clip(np.dot(spine_norm, vertical_vec), -1.0, 1.0)))
+        
+        # Calculate current head forward position
+        current_head_forward = abs(ear_pt[0] - sh_pt[0])
+        
+        # Compare with baseline
+        baseline_spine = self.posture_baseline['spine_angle']
+        baseline_head = self.posture_baseline['head_forward']
+        
+        # Check if posture is getting worse
+        spine_deviation = abs(current_spine_angle - baseline_spine)
+        head_deviation = current_head_forward - baseline_head
+        
+        # Determine posture status
+        posture_issues = []
+        overall_status = "GOOD"
+        status_color = (0, 255, 0)  # Green
+        
+        # Spine angle threshold (more than 15 degrees deviation is bad)
+        if spine_deviation > 15:
+            posture_issues.append("Spine alignment off")
+            overall_status = "BAD"
+            status_color = (0, 0, 255)  # Red
+        elif spine_deviation > 8:
+            posture_issues.append("Spine slightly off")
+            overall_status = "FAIR"
+            status_color = (0, 255, 255)  # Yellow
+        
+        # Head forward threshold (20+ pixels forward is bad)
+        if head_deviation > 20:
+            posture_issues.append("Head too forward")
+            overall_status = "BAD"
+            status_color = (0, 0, 255)
+        elif head_deviation > 10:
+            posture_issues.append("Head slightly forward")
+            if overall_status == "GOOD":
+                overall_status = "FAIR"
+                status_color = (0, 255, 255)
+        
+        # Draw posture feedback
+        cv2.putText(frame, f"Posture: {overall_status}", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3)
+        
+        # Show detailed metrics
+        cv2.putText(frame, f"Spine angle: {current_spine_angle:.1f}° (baseline: {baseline_spine:.1f}°)", 
+                    (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"Head forward: {current_head_forward}px (baseline: {baseline_head}px)", 
+                    (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Show specific issues
+        if posture_issues:
+            for i, issue in enumerate(posture_issues):
+                cv2.putText(frame, f"• {issue}", (10, 150 + i*25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        # Visual indicators on the pose
+        # Draw reference lines
+        cv2.line(frame, (sh_pt[0], sh_pt[1]), (sh_pt[0], sh_pt[1] + 100), (255, 255, 255), 1)  # Vertical reference
+        cv2.line(frame, tuple(sh_pt), tuple(hp_pt), (0, 255, 0) if overall_status == "GOOD" else (0, 0, 255), 3)  # Spine line
+        
+        # Highlight key points
+        cv2.circle(frame, tuple(ear_pt), 8, (255, 0, 255), -1)  # Ear
+        cv2.circle(frame, tuple(sh_pt), 8, (0, 255, 0), -1)     # Shoulder
+        cv2.circle(frame, tuple(hp_pt), 8, (255, 0, 0), -1)     # Hip
+        
+        # Instructions
+        cv2.putText(frame, "Sit sideways to camera for best results", (10, h-60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, "Press 'r' to recalibrate", (10, h-40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
         return frame
 
     def process_object_detection(self, frame):
