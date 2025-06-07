@@ -51,4 +51,4 @@ An all-in-one desktop application offering multiple computer vision demos and to
 - Integrate a calibration step for distance measurement units  
 - Export session logs & statistics (e.g., total exercise reps)  
 - Modularize processing pipelines into separate files/packages  
-```
+
