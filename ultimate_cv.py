@@ -12,6 +12,7 @@ import json
 import os
 from datetime import datetime
 import pickle
+import winsound
 
 class CVApp:
     def __init__(self):
@@ -41,6 +42,8 @@ class CVApp:
         self.pushup_counter = RepCounter(down_threshold=90, up_threshold=160)
         self.pullup_counter = RepCounter(down_threshold=90, up_threshold=160)
         self.squat_counter = RepCounter(down_threshold=90, up_threshold=160)
+        # track last posture state (good vs bad)
+        self.last_posture_ok = True
         
         # Face recognition database
         self.face_database = self.load_face_database()
@@ -144,7 +147,8 @@ class CVApp:
             ("Hand Gesture Detection", "hand_gesture"),
             ("Color Object Tracking", "color_tracking"),
             ("Motion Detection", "motion_detection"),
-            ("Distance Measurement", "distance_measure")
+            ("Distance Measurement", "distance_measure"),
+            ("Posture Checker", "posture_checker"),
         ]
         
         button_frame = ttk.Frame(advanced_frame)
@@ -213,21 +217,6 @@ General Controls:
         ttk.Button(btn_frame, text="Export Corrections", 
                   command=self.export_corrections).pack(side='left', padx=5)
         
-        # Face Database Management
-        face_frame = ttk.LabelFrame(settings_frame, text="Face Recognition Database", padding="10")
-        face_frame.pack(fill='x', pady=10)
-        
-        ttk.Label(face_frame, text=f"Registered faces: {len(self.face_database)}", 
-                 font=("Arial", 10)).pack(anchor='w')
-        
-        face_btn_frame = ttk.Frame(face_frame)
-        face_btn_frame.pack(fill='x', pady=5)
-        
-        ttk.Button(face_btn_frame, text="Manage Face Database", 
-                  command=self.manage_face_database).pack(side='left', padx=5)
-        ttk.Button(face_btn_frame, text="Clear Face Database", 
-                  command=self.clear_face_database).pack(side='left', padx=5)
-        
         # Statistics
         stats_frame = ttk.LabelFrame(settings_frame, text="Usage Statistics", padding="10")
         stats_frame.pack(fill='x', pady=10)
@@ -273,7 +262,7 @@ General Controls:
             )
 
         # 3) Pose estimation (for pushup/pullup/squat and hand gestures)
-        if mode in ["pushup", "pullup", "squat", "hand_gesture"] and self.pose is None:
+        if mode in ["pushup", "pullup", "squat", "hand_gesture", "posture_checker"] and self.pose is None:
             self.status_var.set("Loading pose estimation...")
             self.root.update()
             mp_pose = mp.solutions.pose
@@ -343,6 +332,8 @@ General Controls:
                 frame = self.process_motion_detection(frame)
             elif self.current_mode == "distance_measure":
                 frame = self.process_distance_measurement(frame)
+            elif self.current_mode == "posture_checker":
+                frame = self.process_posture_checker(frame)
             
             # Add help overlay
             cv2.putText(frame, "Press 'h' for help, 'q' to quit", (10, frame.shape[0] - 20),
@@ -357,7 +348,52 @@ General Controls:
                 self.show_help_overlay()
         
         self.stop_camera()
-    
+
+    #posture checker
+    def process_posture_checker(self, frame):
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.pose.process(img_rgb)
+
+        if not results.pose_landmarks:
+            cv2.putText(frame, "Sit fully in view", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            return frame
+
+        h, w, _ = frame.shape
+        lm = results.pose_landmarks.landmark
+
+        # helper to scale normalized coords
+        def pt(i):
+            return np.array([int(lm[i].x*w), int(lm[i].y*h)])
+
+        # get shoulder, hip, knee on right side
+        shoulder = pt(mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER.value)
+        hip      = pt(mp.solutions.pose.PoseLandmark.RIGHT_HIP.value)
+        knee     = pt(mp.solutions.pose.PoseLandmark.RIGHT_KNEE.value)
+
+        # compute angle at the hip
+        angle = calculate_angle(shoulder, hip, knee)
+
+        # draw skeleton
+        mp.solutions.drawing_utils.draw_landmarks(
+            frame, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
+
+        # decide posture
+        if angle < 150:
+            color = (0, 0, 255)
+            status = "Bad Posture!"
+        else:
+            color = (0, 255, 0)
+            status = "Good Posture"
+
+        # overlay text and angle
+        cv2.putText(frame, f"Hip angle: {angle:.0f}°", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(frame, status, (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+
+        return frame
+
     def process_object_detection(self, frame):
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.yolo_model(img_rgb, size=640)
@@ -898,7 +934,6 @@ General Controls:
     def on_closing(self):
         self.stop_camera()
         self.root.destroy()
-
 
 class RepCounter:
     def __init__(self, down_threshold, up_threshold):
